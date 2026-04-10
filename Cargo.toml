@@ -1,0 +1,66 @@
+[package]
+name        = "petcli"
+version     = "0.1.0"
+edition     = "2021"
+description = "Animated Pokemon pets living in your terminal"
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/drayy/petcli"
+keywords    = ["pokemon", "terminal", "pet", "tui", "animation"]
+categories  = ["command-line-utilities"]
+
+[[bin]]
+name = "petcli"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.6", features = ["derive", "color"] }
+
+# TUI
+ratatui   = "0.30"
+crossterm = "0.29"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP (rustls = no OpenSSL dep on Arch)
+reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
+
+# Image decoding
+image       = { version = "0.25", features = ["gif", "png"] }
+gif         = "0.13"
+gif-dispose = "5"
+
+# Serialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+
+# Encoding
+base64 = "0.22"
+
+# Platform dirs (XDG-compliant)
+directories = "5"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Error handling
+anyhow    = "1"
+thiserror = "1"
+
+# Randomness
+rand = { version = "0.8", features = ["small_rng"] }
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender   = "0.2"
+
+[profile.release]
+opt-level = 3
+lto       = true
+strip     = true

@@ -1,0 +1,9 @@
+pub mod animation;
+pub mod cli;
+pub mod config;
+pub mod error;
+pub mod renderer;
+pub mod sim;
+pub mod sprite;
+pub mod state;
+pub mod tui;
