@@ -5,7 +5,7 @@ use directories::ProjectDirs;
 
 use super::party::Party;
 
-fn data_dir() -> Result<PathBuf> {
+pub fn data_dir() -> Result<PathBuf> {
     let dirs = ProjectDirs::from("", "", "petcli")
         .context("could not determine data directory")?;
     let path = dirs.data_dir().to_path_buf();

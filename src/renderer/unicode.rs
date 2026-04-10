@@ -1,110 +1,98 @@
-use std::collections::HashMap;
+use std::io::Write;
 
-use image::{Rgba, RgbaImage};
-use ratatui::{
-    style::{Color, Style},
-    text::{Line, Span},
+use anyhow::Result;
+use crossterm::{
+    cursor::MoveTo,
+    queue,
+    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
 };
+use image::{imageops, Rgba, RgbaImage};
 
-use crate::animation::state_machine::AnimState;
-use crate::sprite::gif::DecodedFrame;
+/// Sprite display dimensions in terminal cells.
+/// 48px source scaled to 24 cols × 24 pixel rows → 12 half-block rows.
+pub const SPRITE_COLS: u16 = 24;
+pub const SPRITE_ROWS: u16 = 12;
 
-const TARGET_COLS: u32 = 24;
-const TARGET_ROWS: u32 = 12; // ×2 pixel rows via half-blocks
+/// A rendered frame: rows of (fg, bg, char) cells.
+pub type RenderedRow = Vec<(Color, Color, char)>;
+pub type RenderedFrame = Vec<RenderedRow>;
 
-pub struct UnicodeRenderer {
-    /// Per-state pre-rendered frames: state → Vec<frame_rows>
-    frames: HashMap<AnimState, Vec<Vec<Line<'static>>>>,
-}
+/// Pre-render a decoded GIF frame into half-block terminal cells.
+/// Set `flip = true` to mirror horizontally (for left-facing walk).
+pub fn render_frame(img: &RgbaImage, flip: bool) -> RenderedFrame {
+    let w = SPRITE_COLS as u32;
+    let h = (SPRITE_ROWS * 2) as u32; // 2 pixel rows per half-block row
 
-impl UnicodeRenderer {
-    /// Pre-render frames for all states at once from the SpriteSheet.
-    pub fn from_sheet(sheet: &crate::sprite::sheet::SpriteSheet) -> Self {
-        let states = [
-            AnimState::Idle,
-            AnimState::WalkLeft,
-            AnimState::WalkRight,
-            AnimState::Sleep,
-            AnimState::Eat,
-            AnimState::HappyBounce,
-            AnimState::Hatch,
-        ];
+    let scaled = if flip {
+        let flipped = imageops::flip_horizontal(img);
+        imageops::resize(&flipped, w, h, imageops::FilterType::Nearest)
+    } else {
+        imageops::resize(img, w, h, imageops::FilterType::Nearest)
+    };
 
-        let mut frames = HashMap::new();
-        for state in states {
-            let raw = sheet.frames_for(state);
-            if !raw.is_empty() {
-                frames.insert(state, raw.iter().map(|f| render_frame(&f.pixels)).collect());
-            }
-        }
-
-        Self { frames }
-    }
-
-    /// Pre-render from a flat frame list (Idle only — for backwards compat).
-    pub fn from_frames(raw_frames: &[DecodedFrame]) -> Self {
-        let rendered: Vec<Vec<Line<'static>>> =
-            raw_frames.iter().map(|f| render_frame(&f.pixels)).collect();
-
-        let mut frames = HashMap::new();
-        for state in [AnimState::Idle, AnimState::WalkLeft, AnimState::WalkRight,
-                       AnimState::Sleep, AnimState::Eat, AnimState::HappyBounce, AnimState::Hatch] {
-            frames.insert(state, rendered.clone());
-        }
-
-        Self { frames }
-    }
-
-    /// Get the rendered lines for the current animation state + frame index.
-    pub fn get_lines(&self, state: AnimState, frame_index: usize) -> &[Line<'static>] {
-        let bank = self
-            .frames
-            .get(&state)
-            .or_else(|| self.frames.get(&AnimState::Idle));
-
-        match bank {
-            Some(bank) if !bank.is_empty() => {
-                &bank[frame_index.min(bank.len() - 1)]
-            }
-            _ => &[],
-        }
-    }
-}
-
-fn render_frame(img: &RgbaImage) -> Vec<Line<'static>> {
-    let scaled = image::imageops::resize(
-        img,
-        TARGET_COLS,
-        TARGET_ROWS * 2,
-        image::imageops::FilterType::Nearest,
-    );
-
-    let width = scaled.width();
     let height = scaled.height();
-    let mut lines = Vec::new();
+    let width = scaled.width();
+    let mut rows = Vec::with_capacity(SPRITE_ROWS as usize);
 
     let mut y = 0u32;
     while y + 1 < height {
-        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut row = Vec::with_capacity(width as usize);
         for x in 0..width {
             let upper = scaled.get_pixel(x, y);
             let lower = scaled.get_pixel(x, y + 1);
-            let fg = if upper[3] < 128 { Color::Reset } else { rgba_to_ansi(upper) };
-            let bg = if lower[3] < 128 { Color::Reset } else { rgba_to_ansi(lower) };
-            spans.push(Span::styled("▀", Style::default().fg(fg).bg(bg)));
+
+            let u_opaque = upper[3] >= 128;
+            let l_opaque = lower[3] >= 128;
+
+            let (ch, fg, bg) = match (u_opaque, l_opaque) {
+                (true, true)   => ('▀', ansi_color(upper), ansi_color(lower)),
+                (true, false)  => ('▀', ansi_color(upper), Color::Reset),
+                (false, true)  => ('▄', ansi_color(lower), Color::Reset),
+                (false, false) => (' ', Color::Reset, Color::Reset),
+            };
+            row.push((fg, bg, ch));
         }
-        lines.push(Line::from(spans));
+        rows.push(row);
         y += 2;
     }
 
-    lines
+    rows
 }
 
-fn rgba_to_ansi(px: &Rgba<u8>) -> Color {
-    fn step(c: u8) -> u8 {
-        if c < 48 { 0 } else if c < 115 { 1 } else if c < 155 { 2 }
-        else if c < 195 { 3 } else if c < 235 { 4 } else { 5 }
+/// Write a pre-rendered frame to the terminal at position (col, row).
+pub fn draw_frame(out: &mut impl Write, frame: &RenderedFrame, col: u16, row: u16) -> Result<()> {
+    for (r, line) in frame.iter().enumerate() {
+        queue!(out, MoveTo(col, row + r as u16))?;
+        for (fg, bg, ch) in line {
+            queue!(
+                out,
+                SetForegroundColor(*fg),
+                SetBackgroundColor(*bg),
+                Print(ch)
+            )?;
+        }
+        queue!(out, ResetColor)?;
     }
-    let index = 16 + 36 * step(px[0]) + 6 * step(px[1]) + step(px[2]);
-    Color::Indexed(index)
+    Ok(())
+}
+
+/// Erase the sprite area at (col, row) by overwriting with spaces.
+pub fn clear_frame(out: &mut impl Write, col: u16, row: u16) -> Result<()> {
+    let blank: String = " ".repeat(SPRITE_COLS as usize + 1);
+    for r in 0..SPRITE_ROWS {
+        queue!(out, MoveTo(col, row + r), Print(&blank))?;
+    }
+    Ok(())
+}
+
+fn ansi_color(px: &Rgba<u8>) -> Color {
+    fn step(c: u8) -> u8 {
+        if c < 48 { 0 }
+        else if c < 115 { 1 }
+        else if c < 155 { 2 }
+        else if c < 195 { 3 }
+        else if c < 235 { 4 }
+        else { 5 }
+    }
+    Color::AnsiValue(16 + 36 * step(px[0]) + 6 * step(px[1]) + step(px[2]))
 }

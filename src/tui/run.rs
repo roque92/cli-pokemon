@@ -1,139 +1,122 @@
+//! Launches (or stops) the background daemon that draws the walking pet.
+
 use std::{
-    io::{self, Write},
-    time::{Duration, Instant},
+    io::{self, IsTerminal},
+    path::PathBuf,
+    process::Stdio,
 };
 
 use anyhow::Result;
-use crossterm::{
-    event,
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{backend::CrosstermBackend, Terminal};
-use tokio::sync::mpsc;
 
 use crate::{
-    renderer::{kitty::image_id, RendererKind},
+    renderer::RendererKind,
     sprite,
-    state::{decay, persist},
+    state::{party::Party, pet::PetStatus},
 };
 
-use super::{app::App, draw, draw_compact, input};
+// ── Public API ────────────────────────────────────────────────────────────────
 
-const TICK_MS: u64 = 16; // ~60fps
+/// Start the pet daemon. Caches the sprite first so the daemon starts
+/// instantly, then forks it into the background and returns the prompt.
+pub async fn run(party: Party, renderer_kind: RendererKind) -> Result<()> {
+    if !io::stdout().is_terminal() {
+        anyhow::bail!("petcli requires an interactive terminal.");
+    }
 
-pub async fn run(mut app: App) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let (sprite_tx, mut sprite_rx) = mpsc::channel(4);
-
-    // Track which species is currently loaded to detect hatch/evolution changes
-    let mut loaded_species: Option<(u16, bool)> = None;
-
-    let mut last_tick = Instant::now();
-
-    loop {
-        // Check for loaded sprite
-        if let Ok(sheet) = sprite_rx.try_recv() {
-            app.on_sprite_loaded(sheet);
+    // Already running?
+    if let Some(pid) = read_pid()? {
+        if process_alive(pid) {
+            println!("Pet already running (PID {pid}). Use `petcli stop` to remove it.");
+            return Ok(());
         }
+        // Stale pid file
+        let _ = std::fs::remove_file(pid_path()?);
+    }
 
-        // Kick off sprite load whenever the active pet's species/shiny changes
-        // (covers initial load, hatch, evolution, party cycle)
-        let current_species = app
-            .party
-            .active_pet()
-            .filter(|p| p.is_alive())
-            .map(|p| (p.species_id, p.shiny));
+    // Collect all alive pets
+    let alive: Vec<_> = party
+        .slots
+        .iter()
+        .flatten()
+        .filter(|p| matches!(p.status, PetStatus::Alive))
+        .collect();
 
-        if current_species != loaded_species && !app.loading_sprite {
-            if let Some((species_id, shiny)) = current_species {
-                app.loading_sprite = true;
-                loaded_species = Some((species_id, shiny));
-                let tx = sprite_tx.clone();
-                tokio::spawn(async move {
-                    match sprite::load_sheet(species_id, shiny).await {
-                        Ok(sheet) => { let _ = tx.send(sheet).await; }
-                        Err(e) => tracing::warn!("sprite load failed: {}", e),
-                    }
-                });
-            } else {
-                loaded_species = None;
-            }
-        }
+    if alive.is_empty() {
+        println!("No Pokemon set. Run `petcli set <name>` first.");
+        return Ok(());
+    }
 
-        let delta_ms = last_tick.elapsed().as_millis().min(500) as u32;
-        last_tick = Instant::now();
-
-        // Apply decay to all living party members
-        for slot in app.party.slots.iter_mut().flatten() {
-            decay::apply_tick(slot, delta_ms);
-        }
-
-        // Tick animation + walk for active pet
-        if let Some(sheet) = &app.sheet {
-            if let Some(stats) = app.party.active_pet().map(|p| p.stats.clone()) {
-                app.ticker.tick(delta_ms, sheet, &stats, &mut app.rng);
-
-                let bounds = app.play_bounds;
-                let mut anim_state = app.ticker.current_state;
-                if let Some(walk) = &mut app.walk {
-                    walk.step(delta_ms, bounds, &mut anim_state, &mut app.rng);
-                }
-            }
-        }
-
-        // Draw TUI (compact or full)
-        if app.compact {
-            terminal.draw(|f| draw_compact::draw(f, &mut app))?;
-        } else {
-            terminal.draw(|f| draw::draw(f, &mut app))?;
-        }
-
-        // Post-draw: Kitty animation placement
-        if app.renderer_kind == RendererKind::Kitty {
-            if let Some(sheet) = &app.sheet {
-                if let (Some(walk), Some(pet)) = (&app.walk, app.party.active_pet()) {
-                    let anim_state = app.ticker.current_state;
-                    let frames = sheet.frames_for(anim_state);
-                    if !frames.is_empty() {
-                        let img_id = image_id(pet.species_id, pet.shiny, anim_state as u8);
-                        let pos = walk.pos;
-                        let mut out = io::stdout();
-                        let _ = app.kitty.upload_animation(img_id, frames, &mut out);
-                        let _ = app.kitty.place(img_id, pos, &mut out);
-                        let _ = out.flush();
-                    }
-                }
-            }
-        }
-
-        // Poll for input
-        if event::poll(Duration::from_millis(TICK_MS))? {
-            let ev = event::read()?;
-            if let Some(tui_event) = input::map_event(ev) {
-                app.handle_event(tui_event);
-            }
-        }
-
-        if app.should_quit {
-            break;
+    // Warm sprite cache for all alive pets so the daemon starts instantly
+    for pet in &alive {
+        print!("Loading {}... ", pet.display_name());
+        let _ = io::Write::flush(&mut io::stdout());
+        match sprite::load_sheet(pet.species_id, pet.shiny).await {
+            Ok(_) => println!("ok"),
+            Err(e) => println!("(offline: {e})"),
         }
     }
 
-    // Clean up Kitty images before exit
-    {
-        let mut out = io::stdout();
-        let _ = write!(out, "\x1b_Ga=d,d=a,q=2;\x1b\\");
-        let _ = out.flush();
-    }
+    // Spawn daemon (self with hidden --daemon flag)
+    let exe = std::env::current_exe()?;
+    let renderer_flag = match renderer_kind {
+        RendererKind::Kitty   => "kitty",
+        RendererKind::Unicode => "unicode",
+    };
 
-    persist::save(&app.party)?;
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    let child = std::process::Command::new(&exe)
+        .args(["--daemon", renderer_flag])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let pid = child.id();
+    std::fs::write(pid_path()?, pid.to_string())?;
+    std::mem::forget(child); // detach — let it run in background
+
+    let names: Vec<String> = alive.iter().map(|p| p.display_name()).collect();
+    println!("{} now walking in your terminal!", names.join(", "));
+    println!("Run `petcli stop` to remove  |  `petcli add <name>` to add more");
     Ok(())
+}
+
+/// Kill the daemon and restore the terminal.
+pub fn stop() -> Result<()> {
+    let Some(pid) = read_pid()? else {
+        println!("No pet is running.");
+        return Ok(());
+    };
+
+    if process_alive(pid) {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        // Give it a moment to clean up
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        println!("Pet stopped.");
+    } else {
+        println!("Pet was not running (stale PID file).");
+    }
+
+    let _ = std::fs::remove_file(pid_path()?);
+    Ok(())
+}
+
+// ── PID file helpers ──────────────────────────────────────────────────────────
+
+fn pid_path() -> Result<PathBuf> {
+    let dir = crate::state::persist::data_dir()?;
+    Ok(dir.join("daemon.pid"))
+}
+
+fn read_pid() -> Result<Option<u32>> {
+    let path = pid_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let s = std::fs::read_to_string(&path)?;
+    Ok(s.trim().parse::<u32>().ok())
+}
+
+fn process_alive(pid: u32) -> bool {
+    // kill(pid, 0) returns 0 if process exists and we can signal it
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }

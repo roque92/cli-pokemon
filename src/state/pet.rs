@@ -52,6 +52,20 @@ impl Pet {
         }
     }
 
+    pub fn new_alive(species_id: u16, shiny: bool) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            species_id,
+            nickname: None,
+            shiny,
+            stats: PetStats { hunger: 100.0, happiness: 100.0, energy: 100.0 },
+            exp: 0,
+            level: 1,
+            status: PetStatus::Alive,
+            last_updated: Utc::now(),
+        }
+    }
+
     pub fn display_name(&self) -> String {
         self.nickname
             .clone()

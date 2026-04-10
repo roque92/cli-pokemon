@@ -49,7 +49,7 @@ impl AnimTicker {
             self.transition_to(AnimState::from_event(event), 1);
         }
 
-        let frames = sheet.frames_for(self.current_state);
+        let frames = sheet.idle_frames();
         if frames.is_empty() {
             return 0;
         }

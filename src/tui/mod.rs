@@ -1,6 +1,3 @@
-pub mod app;
-pub mod draw;
-pub mod draw_compact;
-pub mod input;
+pub mod daemon;
+pub mod picker;
 pub mod run;
-pub mod widgets;

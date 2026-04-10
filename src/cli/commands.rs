@@ -1,131 +1,116 @@
-use anyhow::Result;
-use rand::Rng;
+use anyhow::{bail, Result};
 
 use crate::{
     error::PetcliError,
-    sim::interactions::{self, SimEvent},
     state::{
         party::Party,
-        persist,
         pet::{Pet, PetStatus},
-        species::{self, GEN1_RANGE},
+        species,
     },
 };
 
-pub fn catch(party: &mut Party, force_shiny: bool, shiny_rate: u32) -> Result<()> {
-    let mut rng = rand::thread_rng();
-    let species_id: u16 = rng.gen_range(GEN1_RANGE);
-    let shiny = force_shiny || rng.gen_ratio(1, shiny_rate.max(1));
-
-    let species = species::get(species_id);
-    let egg_cycles = species.map(|s| s.egg_cycles as u32 * 5).unwrap_or(20);
+/// Set which Pokemon is displayed (by name or Pokedex number).
+pub fn set_pokemon(party: &mut Party, input: &str, shiny: bool) -> Result<()> {
+    let species_id = resolve_species(input)?;
     let name = species::name(species_id);
 
-    let pet = Pet::new_egg(species_id, shiny, egg_cycles);
-    let slot = party.add_pet(pet)?;
+    // Replace active slot (or first slot if empty)
+    let slot = if party.slots.iter().any(|s| s.is_none()) || party.count() == 0 {
+        party.active
+    } else {
+        party.active
+    };
+
+    party.slots[slot] = Some(Pet::new_alive(species_id, shiny));
+    party.active = slot;
 
     println!(
-        "A wild egg appeared! It contains {} (slot {}){}",
+        "Set to {}{} — run `petcli` to watch it walk!",
         name,
-        slot + 1,
-        if shiny { " ✦ Shiny!" } else { "" }
+        if shiny { " ✦ (shiny)" } else { "" }
     );
-    println!("Interact with it to hatch!");
-
-    persist::save(party)?;
     Ok(())
 }
 
 pub fn status(party: &Party) {
-    if party.count() == 0 {
-        println!("Your party is empty. Use `petcli catch` to get a Pokemon!");
+    let Some(pet) = party.active_pet() else {
+        println!("No Pokemon set. Run: petcli set <name-or-number>");
         return;
-    }
+    };
 
-    println!("── Party ─────────────────────────────────────────");
-    for (i, slot) in party.slots.iter().enumerate() {
-        let Some(pet) = slot else { continue };
-        let active = if i == party.active { "▶ " } else { "  " };
-        let shiny = if pet.shiny { " ✦" } else { "" };
-        let status = match &pet.status {
-            PetStatus::Egg { hatch_steps } => format!("Egg ({} steps left)", hatch_steps),
-            PetStatus::Alive => "Alive".to_string(),
-            PetStatus::Fainted => "Fainted — needs medicine!".to_string(),
-        };
-        println!(
-            "{}[{}] {}{} Lv.{} | {} | Hunger: {:.0} | Happy: {:.0} | Energy: {:.0}",
-            active,
-            i + 1,
-            pet.display_name(),
-            shiny,
-            pet.level,
-            status,
-            pet.stats.hunger,
-            pet.stats.happiness,
-            pet.stats.energy,
-        );
-    }
-    println!("Wallet: {} coins", party.wallet);
+    let shiny = if pet.shiny { " ✦" } else { "" };
+    let state = match &pet.status {
+        PetStatus::Alive  => "alive".to_string(),
+        PetStatus::Egg { .. } => "egg".to_string(),
+        PetStatus::Fainted    => "fainted".to_string(),
+    };
+    println!(
+        "{}{} — {}",
+        pet.display_name(),
+        shiny,
+        state
+    );
 }
 
-pub fn feed(party: &mut Party) -> Result<()> {
-    match interactions::feed(party) {
-        Ok(ev) => {
-            let name = party.active_pet().map(|p| p.display_name()).unwrap_or_default();
-            println!("{} munches happily!", name);
-            print_sim_event(ev);
-        }
-        Err(PetcliError::NoPet) => println!("No active Pokemon! Use `petcli catch` first."),
-        Err(e) => return Err(e.into()),
-    }
-    persist::save(party)?;
+/// Add a Pokemon to the next free slot (up to 6 total).
+pub fn add_pokemon(party: &mut Party, input: &str, shiny: bool) -> Result<()> {
+    let species_id = resolve_species(input)?;
+    let name = species::name(species_id);
+
+    party.add_pet(Pet::new_alive(species_id, shiny)).map_err(|e| match e {
+        PetcliError::PartyFull => anyhow::anyhow!(
+            "Already have 6 Pokemon walking. Use `petcli set <name>` to replace one."
+        ),
+        e => e.into(),
+    })?;
+
+    println!(
+        "Added {}{} — restart with `petcli` to see them all!",
+        name,
+        if shiny { " ✦ (shiny)" } else { "" }
+    );
     Ok(())
 }
 
-pub fn pet_cmd(party: &mut Party) -> Result<()> {
-    match interactions::pet_pokemon(party) {
-        Ok(ev) => {
-            let name = party.active_pet().map(|p| p.display_name()).unwrap_or_default();
-            println!("{} loves the attention!", name);
-            print_sim_event(ev);
-        }
-        Err(PetcliError::NoPet) => println!("No active Pokemon! Use `petcli catch` first."),
-        Err(e) => return Err(e.into()),
+/// Print all Gen 1 Pokemon in a compact table.
+pub fn list_pokemon() {
+    println!("── Available Pokemon (Gen 1) ────────────────────────────────");
+    const COLS: usize = 3;
+    let names: Vec<(u16, String)> = (1u16..=151)
+        .map(|id| (id, species::name(id)))
+        .collect();
+
+    for row in names.chunks(COLS) {
+        let cells: Vec<String> = row
+            .iter()
+            .map(|(id, name)| format!("{id:>3}. {name:<13}"))
+            .collect();
+        println!("  {}", cells.join("  "));
     }
-    persist::save(party)?;
-    Ok(())
+    println!();
+    println!("Use: petcli set <name-or-number>   — replace current pet");
+    println!("     petcli add <name-or-number>   — add alongside current pets");
 }
 
-pub fn list_party(party: &Party) {
-    status(party);
-}
+fn resolve_species(input: &str) -> Result<u16> {
+    // Try as a Pokedex number first
+    if let Ok(n) = input.trim().parse::<u16>() {
+        if n >= 1 && n <= 151 {
+            return Ok(n);
+        }
+        bail!("Pokedex number must be 1–151 (Gen 1 only for now)");
+    }
 
-pub fn inventory(party: &Party) {
-    println!("── Wallet: {} coins ─────────────────────", party.wallet);
-    println!("── Inventory ────────────────────────────");
-    let total: u32 = party.inventory.stacks.iter().map(|s| s.qty).sum();
-    if total == 0 {
-        println!("  (empty) — open the TUI and press [s] to shop");
-        return;
-    }
-    for stack in &party.inventory.stacks {
-        if stack.qty > 0 {
-            println!("  {:>2}x  {}", stack.qty, stack.kind.display_name());
+    // Try by name (case-insensitive)
+    let query = input.trim().to_lowercase();
+    for id in 1u16..=151 {
+        if species::name(id).to_lowercase() == query {
+            return Ok(id);
         }
     }
-}
 
-fn print_sim_event(ev: SimEvent) {
-    match ev {
-        SimEvent::None => {}
-        SimEvent::Hatched { species_name } => {
-            println!("🎉 Your egg hatched into {}!", species_name);
-        }
-        SimEvent::Evolved { from, to } => {
-            println!("✨ {} evolved into {}!", from, to);
-        }
-        SimEvent::LevelUp { level } => {
-            println!("⬆  Level up! Now Lv.{}!", level);
-        }
-    }
+    bail!(
+        "Unknown Pokemon {:?}. Use a name (e.g. \"pikachu\") or number (1–151).",
+        input
+    )
 }

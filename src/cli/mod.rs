@@ -12,29 +12,33 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Compact mode: minimal pane for tmux/zellij (no sidebar)
-    #[arg(long, short = 'c', global = true)]
-    pub compact: bool,
+    /// Internal: run as background daemon with the given renderer
+    #[arg(long, hide = true, value_name = "RENDERER")]
+    pub daemon: Option<String>,
 }
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Catch a new random Pokemon egg
-    Catch {
-        /// Force a shiny (debug)
-        #[arg(long, hide = true)]
+    /// Set which Pokemon appears (by name or Pokedex number)
+    Set {
+        /// Pokemon name or number (e.g. "pikachu" or "25")
+        pokemon: String,
+        /// Force shiny variant
+        #[arg(long)]
         shiny: bool,
     },
-    /// Show party status
+    /// Show current Pokemon
     Status,
-    /// Feed your active Pokemon
-    Feed,
-    /// Pet your active Pokemon
-    Pet,
-    /// List and manage your party
-    Party,
-    /// Show inventory and wallet
-    Inventory,
-    /// Print and initialise config file path
-    Config,
+    /// Add another Pokemon (up to 6 walk at once)
+    Add {
+        /// Pokemon name or number (leave empty to open the picker)
+        pokemon: Option<String>,
+        /// Force shiny variant
+        #[arg(long)]
+        shiny: bool,
+    },
+    /// List all available Pokemon
+    Pokemon,
+    /// Remove all pets from your terminal
+    Stop,
 }
