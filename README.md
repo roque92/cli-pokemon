@@ -1,132 +1,186 @@
 # petcli
 
-Animated Pokemon pets living in your terminal.
+Animated Pokemon pets that live in your terminal. Sprites walk freely across the screen while you work — no new window, no alternate screen, just your current terminal.
 
-> The gap: `krabby` shows static Unicode art. `vscode-pokemon` shows animated pixel sprites — but only inside VS Code. **petcli** brings that to the CLI.
+```
+petcli add        # open picker → choose a Pokemon → it appears immediately
+petcli stop       # remove all pets
+```
+
+> **The gap:** `krabby` shows static Unicode art. `vscode-pokemon` shows animated pixel sprites — but only inside VS Code. **petcli** brings that same animation to any terminal.
 
 ---
 
 ## Features
 
-- **Animated pixel sprites** via [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) — works in Kitty, WezTerm, Ghostty
-- **Unicode half-block art fallback** for Alacritty and any other terminal
-- **Full tamagotchi sim** — hunger, happiness, energy decay in real time
-- **Party of 6** — catch eggs, hatch them, evolve your Pokemon
-- **Level-up & evolution** — level-based and happiness-based chains (full Gen 1)
-- **Items & shop** — buy food, toys, medicine with coins earned from interactions
-- **Shiny variants** — 1/8192 chance on catch (configurable)
-- **Compact mode** — minimal pane layout for tmux/zellij ricers
-- **Config file** — tune decay rate, shiny odds, sprite size
+| Feature | Detail |
+|---|---|
+| Animated sprites | Idle + walk GIFs at 8fps, 48×48px source |
+| Two renderers | Kitty graphics protocol (pixel-perfect) · Unicode half-blocks (universal fallback) |
+| Full Gen 1–4 | 493 Pokemon via the vscode-pokemon sprite pack |
+| Gen 5+ fallback | PokeAPI animated sprites (Gen 5 Black/White) · static PNG otherwise |
+| Shiny variants | `--shiny` flag or toggle inside the picker |
+| TUI picker | Searchable list with live sprite preview, filterable by generation |
+| Multi-pet | Up to 6 pets, each with its own independent 2D bouncing walker |
+| Background daemon | Detached process, PID-managed, lives inside your current terminal session |
+| Cursor-safe | Cursor position never moves — uses DECSC/DECRC save/restore each frame |
+| XDG-compliant | Data in `~/.local/share/petcli/` — sprites cached locally after first fetch |
 
 ---
 
 ## Install
 
-```bash
-cargo install petcli
-```
-
-Or build from source:
+**Requirements:** Rust stable toolchain, internet on first run.
 
 ```bash
 git clone https://github.com/drayy/petcli
 cd petcli
-cargo build --release
-./target/release/petcli
+cargo install --path . --locked
 ```
 
 ---
 
 ## Usage
 
-```bash
-petcli              # Launch TUI (animated pet in full layout)
-petcli --compact    # Compact mode: minimal pane for tmux/zellij
+### Add a pet
 
-petcli catch        # Catch a random egg
-petcli status       # Show party stats
-petcli feed         # Feed active Pokemon
-petcli pet          # Pet active Pokemon
-petcli inventory    # Show wallet and items
-petcli config       # Print config file location
+Open the interactive TUI picker (recommended):
+
+```bash
+petcli add
 ```
 
-### TUI Keybinds
+Or add directly by name or Pokedex number:
+
+```bash
+petcli add pikachu
+petcli add 25
+petcli add eevee --shiny
+```
+
+### Picker controls
 
 | Key | Action |
-|-----|--------|
-| `f` | Feed active Pokemon |
-| `p` | Pet active Pokemon |
-| `u` | Use best item from inventory |
-| `s` | Open shop |
-| `Tab` | Cycle party |
-| `q` / `Esc` | Quit |
+|---|---|
+| `↑` / `↓` or `j` / `k` | Move selection |
+| `/` | Search by name |
+| `Tab` | Cycle generation filter (All → Gen 1 → 2 → 3 → 4) |
+| `1` `2` `3` `4` `a` | Jump to a generation filter directly |
+| `s` | Toggle shiny preview |
+| `Enter` | Add selected Pokemon and exit |
+| `q` / `Esc` | Quit without adding |
 
-**In shop:**
+### All commands
 
-| Key | Action |
-|-----|--------|
-| `↑` / `k` | Navigate up |
-| `↓` / `j` | Navigate down |
-| `Enter` | Buy (confirm on second press) |
-| `n` / `Esc` | Cancel / close |
+```bash
+petcli add [name|number] [--shiny]   # add a pet (no args = open picker)
+petcli set <name|number> [--shiny]   # replace the whole party with one Pokemon
+petcli status                        # show current party
+petcli pokemon                       # list all 493 available Pokemon
+petcli stop                          # kill the daemon and clear all pets
+```
 
 ---
 
-## Terminal Support
+## How it works
+
+`petcli` spawns a background daemon that re-opens `/dev/tty` from the launching terminal. Each frame:
+
+1. Cursor position is saved with `\x1b7` (DECSC)
+2. Previous sprite cells are erased
+3. All pets are drawn at new positions
+4. Cursor is restored with `\x1b8` (DECRC)
+
+Your shell prompt and typing are completely unaffected. Pets bounce off all four terminal edges using a 2D velocity walker (think DVD screensaver). Terminal size is queried live via `TIOCGWINSZ` so resizing is handled correctly.
+
+The daemon is managed via a PID file at `~/.local/share/petcli/daemon.pid`. `petcli stop` sends `SIGTERM` and removes the file.
+
+---
+
+## Renderer detection
+
+Auto-detected at startup:
 
 | Terminal | Renderer |
-|----------|----------|
-| Kitty | Pixel sprites (Kitty graphics protocol) |
-| WezTerm | Pixel sprites (Kitty graphics protocol) |
-| Ghostty | Pixel sprites (Kitty graphics protocol) |
-| Alacritty | Unicode half-block art (`▀▄` + ANSI 256-color) |
-| Everything else | Unicode half-block art |
+|---|---|
+| Kitty | Kitty graphics protocol (pixel-perfect, native 48×48) |
+| WezTerm | Kitty graphics protocol |
+| Ghostty | Kitty graphics protocol |
+| Alacritty, tmux, everything else | Unicode half-blocks (`▀`) with ANSI 256-color |
+
+Detection checks `$TERM == xterm-kitty` or `$KITTY_WINDOW_ID`. Override with `PETCLI_RENDERER=kitty` or `PETCLI_RENDERER=unicode`.
 
 ---
 
-## Configuration
+## Sprite sources
 
-Config lives at `~/.config/petcli/config.toml` (created automatically on first run of `petcli config`):
+Sprites are fetched on first use and cached in `~/.local/share/petcli/sprites/`.
 
-```toml
-[display]
-compact = false        # default to compact mode
-sprite_size = 96       # pixel size for Kitty renderer
-show_shiny_indicator = true
+| Generation | Source |
+|---|---|
+| Gen 1–4 non-shiny | [jakobhoeg/vscode-pokemon](https://github.com/jakobhoeg/vscode-pokemon) — proper `idle_8fps.gif` + `walk_8fps.gif` |
+| Gen 1–4 shiny | PokeAPI static shiny PNG (no animation available) |
+| Gen 5 | PokeAPI Black/White animated sprites |
+| Gen 6–9 | PokeAPI static PNG |
 
-[game]
-shiny_rate = 8192      # 1-in-N chance of shiny on catch
-decay_rate = 1.0       # stat decay speed multiplier
-coins_per_feed = 2
-coins_per_pet = 5
-```
+Walk frames play while the pet is moving; idle frames play when standing still (currently pets always walk).
 
 ---
 
-## How It Works
+## Known gaps
 
-- **Sprites** are fetched on demand from the [PokeAPI sprites repo](https://github.com/PokeAPI/sprites) (Gen 5 animated GIFs) and cached to `~/.local/share/petcli/sprites/`. Nothing is bundled in the binary.
-- **Kitty rendering** uploads all GIF frames as a multi-frame Kitty animation using APC escape sequences. Kitty handles frame timing internally. The sprite is re-placed when the pet moves.
-- **Unicode rendering** pre-converts every frame to `▀` half-block characters at sprite load time. Each channel is mapped to the nearest xterm-256 color cube entry.
-- **State** persists to `~/.local/share/petcli/state.json`. Stat decay is calculated from the `last_updated` timestamp on each load, so your pet degrades even while petcli is closed.
+**Gen 5–9 walk animation** — The vscode-pokemon pack only covers Gen 1–4. PokeAPI has animated sprites for Gen 5 but only a single-direction loop, not a walk/idle split. Gen 6+ have no animation at all in any freely-licensed pack.
+
+**Shiny Gen 1–4** — The vscode-pokemon pack ships non-shiny only. Shiny requests for Gen 1–4 fall back to a static PokeAPI PNG.
+
+**Kitty multi-image erase** — The Kitty renderer issues `a=d,d=a` (delete all placements) before each redraw. If other Kitty images are on screen (e.g. from another tool), they would also be cleared.
+
+**No true fork** — The daemon is launched via `Command::new(current_exe())` with a hidden `--daemon` flag rather than `fork(2)`. An extra `petcli` process will appear in `ps`.
+
+**Single terminal session** — The daemon is tied to the TTY of the terminal that launched it. Closing the window kills the daemon. There is no way to reattach.
+
+**Party cap** — Hard-coded at 6 (mirrors the Pokemon game limit). Raising it is a one-line change in `src/state/pet.rs`.
 
 ---
 
-## Project Structure
+## Architecture
 
 ```
 src/
-├── animation/      # State machine, frame ticker, walk AI
-├── cli/            # Clap subcommands
-├── config.rs       # Config file (toml)
-├── error.rs        # PetcliError (thiserror)
-├── renderer/       # Kitty + Unicode renderers, auto-detection
-├── sim/            # Egg hatching, evolution, interactions
-├── sprite/         # GIF fetch/cache/decode (gif-dispose for correct compositing)
-├── state/          # Pet, Party, Inventory, decay, persistence
-└── tui/            # ratatui layout, widgets, event loop
+├── cli/
+│   ├── mod.rs          clap command definitions (Set, Add, Status, Pokemon, Stop)
+│   └── commands.rs     command handler implementations
+├── animation/
+│   └── walk.rs         2D bouncing walker — per-pet, independent velocity
+├── renderer/
+│   ├── kitty.rs        Kitty APC graphics protocol renderer
+│   └── unicode.rs      half-block Unicode renderer (▀, ANSI 256-color)
+├── sprite/
+│   ├── fetch.rs        HTTP fetch + local disk cache (vscode-pokemon → PokeAPI)
+│   ├── sheet.rs        SpriteSheet: idle + walk frame sequences
+│   └── gif.rs          GIF decoder using `gif` + `gif-dispose`
+├── state/
+│   ├── persist.rs      JSON party save/load, XDG paths, PID file path
+│   ├── pet.rs          Pet struct (species_id, shiny, alive)
+│   └── pokedex.rs      static table of all 493 Pokemon names + gen_of() helper
+├── tui/
+│   ├── run.rs          daemon launcher + stop logic (spawn self, PID file)
+│   ├── daemon.rs       main render loop (PetActor per pet, DECSC/DECRC, /dev/tty)
+│   └── picker.rs       ratatui TUI picker (search, gen tabs, async sprite preview)
+├── config.rs           config file (toml, ~/.config/petcli/)
+└── error.rs            PetcliError (thiserror)
 ```
+
+---
+
+## References
+
+- [jakobhoeg/vscode-pokemon](https://github.com/jakobhoeg/vscode-pokemon) — sprite source and the original inspiration; this project replicates that animation style in a raw terminal
+- [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) — pixel-level image rendering via APC escape sequences
+- [PokeAPI/sprites](https://github.com/PokeAPI/sprites) — Gen 5 animated and static fallback sprites
+- [ratatui](https://ratatui.rs) — TUI framework used for the picker
+- [crossterm](https://github.com/crossterm-rs/crossterm) — cross-platform terminal control (cursor, color, raw mode)
+- [gif-dispose](https://crates.io/crates/gif-dispose) — correct GIF frame compositing (handles disposal methods that plain `gif` ignores)
 
 ---
 
