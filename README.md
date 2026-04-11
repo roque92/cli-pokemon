@@ -28,6 +28,21 @@ petcli stop       # remove all pets
 
 ---
 
+## Platform support
+
+| Platform | Status | Notes |
+|---|---|---|
+| Linux | Full | Primary development target |
+| macOS | Full | All features work — macOS is Unix |
+| Windows | Supported | Uses `CONOUT$` for TTY, `taskkill`/`tasklist` for process management |
+
+**Terminal requirements by platform:**
+
+- **Linux / macOS** — any terminal (Kitty, Alacritty, WezTerm, Ghostty, iTerm2, etc.)
+- **Windows** — Windows Terminal (recommended), or any VT-100-capable terminal; Kitty renderer requires Windows Terminal with GPU rendering enabled
+
+---
+
 ## Install
 
 **Requirements:** Rust stable toolchain, internet on first run.
@@ -37,6 +52,8 @@ git clone https://github.com/drayy/petcli
 cd petcli
 cargo install --path . --locked
 ```
+
+On Windows, build in a terminal that supports ANSI escape sequences (Windows Terminal or VSCode terminal). The legacy `cmd.exe` prompt does not support the rendering.
 
 ---
 
@@ -84,7 +101,7 @@ petcli stop                          # kill the daemon and clear all pets
 
 ## How it works
 
-`petcli` spawns a background daemon that re-opens `/dev/tty` from the launching terminal. Each frame:
+`petcli` spawns a background daemon that re-opens the current terminal directly (`/dev/tty` on Linux/macOS, `CONOUT$` on Windows). Each frame:
 
 1. Cursor position is saved with `\x1b7` (DECSC)
 2. Previous sprite cells are erased
@@ -93,7 +110,7 @@ petcli stop                          # kill the daemon and clear all pets
 
 Your shell prompt and typing are completely unaffected. Pets bounce off all four terminal edges using a 2D velocity walker (think DVD screensaver). Terminal size is queried live via `TIOCGWINSZ` so resizing is handled correctly.
 
-The daemon is managed via a PID file at `~/.local/share/petcli/daemon.pid`. `petcli stop` sends `SIGTERM` and removes the file.
+The daemon is managed via a PID file at `~/.local/share/petcli/daemon.pid` (Linux/macOS) or `%APPDATA%\petcli\daemon.pid` (Windows). `petcli stop` sends `SIGTERM` on Unix or runs `taskkill /F /PID` on Windows, then removes the file.
 
 ---
 
@@ -135,7 +152,7 @@ Walk frames play while the pet is moving; idle frames play when standing still (
 
 **Kitty multi-image erase** — The Kitty renderer issues `a=d,d=a` (delete all placements) before each redraw. If other Kitty images are on screen (e.g. from another tool), they would also be cleared.
 
-**No true fork** — The daemon is launched via `Command::new(current_exe())` with a hidden `--daemon` flag rather than `fork(2)`. An extra `petcli` process will appear in `ps`.
+**No true fork** — The daemon is launched via `Command::new(current_exe())` with a hidden `--daemon` flag rather than `fork(2)`. An extra `petcli` process will appear in `ps` (Linux/macOS) or Task Manager (Windows).
 
 **Single terminal session** — The daemon is tied to the TTY of the terminal that launched it. Closing the window kills the daemon. There is no way to reattach.
 

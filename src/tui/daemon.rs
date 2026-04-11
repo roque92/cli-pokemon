@@ -4,7 +4,6 @@
 use std::{
     fs::OpenOptions,
     io::Write,
-    os::unix::io::AsRawFd,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -27,8 +26,20 @@ const FRAME_MS: u64 = 125; // 8 fps
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
-extern "C" fn on_signal(_: libc::c_int) {
-    RUNNING.store(false, Ordering::Relaxed);
+// ── Platform: TTY path ────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+const TTY_PATH: &str = "/dev/tty";
+
+/// On Windows, CONOUT$ is the direct console output handle — same role as /dev/tty.
+#[cfg(windows)]
+const TTY_PATH: &str = "CONOUT$";
+
+// ── Platform: terminal size ───────────────────────────────────────────────────
+
+/// Query the current terminal size. Uses crossterm which handles all platforms.
+fn tty_size() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or((80, 24))
 }
 
 // ── Per-pet state ─────────────────────────────────────────────────────────────
@@ -137,19 +148,18 @@ impl PetActor {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(renderer_kind: RendererKind) -> Result<()> {
-    unsafe {
-        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT,  on_signal as *const () as libc::sighandler_t);
-    }
+    // Cross-platform signal/Ctrl-C handler
+    ctrlc::set_handler(|| {
+        RUNNING.store(false, Ordering::Relaxed);
+    })?;
 
     let mut out = OpenOptions::new()
         .write(true)
         .read(true)
-        .open("/dev/tty")
-        .map_err(|e| anyhow::anyhow!("cannot open /dev/tty: {e}"))?;
+        .open(TTY_PATH)
+        .map_err(|e| anyhow::anyhow!("cannot open terminal ({TTY_PATH}): {e}"))?;
 
-    let fd = out.as_raw_fd();
-    let (mut cols, mut rows) = tty_size(fd);
+    let (mut cols, mut rows) = tty_size();
 
     let party = persist::load()?;
 
@@ -198,7 +208,7 @@ pub async fn run(renderer_kind: RendererKind) -> Result<()> {
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     while RUNNING.load(Ordering::Relaxed) {
-        let (new_cols, new_rows) = tty_size(fd);
+        let (new_cols, new_rows) = tty_size();
         if new_cols != cols || new_rows != rows {
             cols = new_cols;
             rows = new_rows;
@@ -266,14 +276,6 @@ fn save_cursor(out: &mut impl Write) -> Result<()> {
 fn restore_cursor(out: &mut impl Write) -> Result<()> {
     write!(out, "\x1b8")?;
     Ok(())
-}
-
-fn tty_size(fd: i32) -> (u16, u16) {
-    unsafe {
-        let mut ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
-        libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws);
-        (ws.ws_col.max(20), ws.ws_row.max(6))
-    }
 }
 
 fn draw_hint(out: &mut impl Write, cols: u16, rows: u16, party: &Party) -> Result<()> {

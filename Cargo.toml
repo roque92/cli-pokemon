@@ -18,8 +18,11 @@ clap = { version = "4.6", features = ["derive", "color"] }
 
 # Terminal control
 crossterm = "0.29"
-libc      = "0.2"
 ratatui   = "0.30"
+ctrlc     = { version = "3", features = ["termination"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Async
 tokio = { version = "1", features = ["full"] }
