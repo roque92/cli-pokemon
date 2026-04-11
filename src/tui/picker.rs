@@ -1,4 +1,4 @@
-//! Interactive Pokemon picker TUI.
+//! Interactive Pokemon picker TUI — opened by `petcli pokemon`.
 //!
 //! Layout:
 //!   ┌── Gen tabs ──────────────────────────────────────────────┐
@@ -50,6 +50,7 @@ use crate::{
         pet::{Pet, PetStatus},
         pokedex::{gen_of, POKEMON},
     },
+    tui::run as daemon_run,
 };
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -81,11 +82,62 @@ impl GenTab {
     }
 }
 
-enum SpriteState {
-    None,
-    Loading(u16),
-    Ready { sheet: SpriteSheet, frame_idx: usize },
-    Failed,
+/// Sprite loading state — always retains the previously-loaded sheet so the
+/// preview panel never goes blank while a new sprite is being fetched.
+struct SpriteCache {
+    /// The sprite currently shown in the preview (may be stale while loading).
+    current: Option<(SpriteSheet, usize)>,
+    /// Species ID being fetched right now, or None if idle.
+    loading: Option<u16>,
+    /// Set when the last fetch failed and no current sprite exists.
+    failed: bool,
+}
+
+impl SpriteCache {
+    fn new() -> Self {
+        Self { current: None, loading: None, failed: false }
+    }
+
+    fn is_loading(&self) -> bool { self.loading.is_some() }
+
+    fn is_ready_for(&self, id: u16, shiny: bool) -> bool {
+        self.current.as_ref()
+            .map(|(s, _)| s.species_id == id && s.shiny == shiny)
+            .unwrap_or(false)
+    }
+
+    fn set_loaded(&mut self, id: u16, shiny: bool, result: Result<SpriteSheet, anyhow::Error>) {
+        if self.loading == Some(id) {
+            self.loading = None;
+        }
+        match result {
+            Ok(sheet) if sheet.species_id == id && sheet.shiny == shiny => {
+                self.current = Some((sheet, 0));
+                self.failed = false;
+            }
+            Ok(_) => {} // species changed before load finished — discard
+            Err(_) => {
+                // Only mark failed if we have nothing to show
+                if self.current.is_none() {
+                    self.failed = true;
+                }
+            }
+        }
+    }
+
+    fn tick_frame(&mut self) {
+        if let Some((_, frame_idx)) = &mut self.current {
+            *frame_idx = frame_idx.wrapping_add(1);
+        }
+    }
+
+    fn frame_idx(&self) -> usize {
+        self.current.as_ref().map(|(_, i)| *i).unwrap_or(0)
+    }
+
+    fn sheet(&self) -> Option<&SpriteSheet> {
+        self.current.as_ref().map(|(s, _)| s)
+    }
 }
 
 struct PickerState {
@@ -97,7 +149,7 @@ struct PickerState {
     search_mode: bool,
     shiny: bool,
     // Sprite preview
-    sprite: SpriteState,
+    sprite: SpriteCache,
     sprite_tx: mpsc::Sender<(u16, bool, Result<SpriteSheet>)>,
     sprite_rx: mpsc::Receiver<(u16, bool, Result<SpriteSheet>)>,
     kitty: KittyRenderer,
@@ -109,7 +161,7 @@ struct PickerState {
 
 impl PickerState {
     fn new(party: &Party) -> Self {
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(8);
         let party_ids: HashSet<u16> = party
             .slots.iter().flatten()
             .filter(|p| matches!(p.status, PetStatus::Alive))
@@ -123,7 +175,7 @@ impl PickerState {
             search: String::new(),
             search_mode: false,
             shiny: false,
-            sprite: SpriteState::None,
+            sprite: SpriteCache::new(),
             sprite_tx: tx,
             sprite_rx: rx,
             kitty: KittyRenderer::new(),
@@ -165,12 +217,12 @@ impl PickerState {
 
     fn trigger_sprite_load(&mut self) {
         let Some((id, _)) = self.selected_pokemon() else { return };
-        // Only reload if the species changed
-        let already_loading = matches!(&self.sprite, SpriteState::Loading(lid) if *lid == id);
-        let already_loaded  = matches!(&self.sprite, SpriteState::Ready { sheet, .. } if sheet.species_id == id && sheet.shiny == self.shiny);
-        if already_loading || already_loaded { return; }
+        // Skip if we already have this species+shiny loaded or are fetching it
+        if self.sprite.is_ready_for(id, self.shiny) { return; }
+        if self.sprite.loading == Some(id) { return; }
 
-        self.sprite = SpriteState::Loading(id);
+        self.sprite.loading = Some(id);
+        self.sprite.failed = false;
         let tx = self.sprite_tx.clone();
         let shiny = self.shiny;
         tokio::spawn(async move {
@@ -203,19 +255,17 @@ impl PickerState {
 
     fn toggle_shiny(&mut self) {
         self.shiny = !self.shiny;
-        self.sprite = SpriteState::None;
+        // Reset only the loading state; keep current sprite shown until shiny loads
+        self.sprite.loading = None;
         self.trigger_sprite_load();
     }
 
     fn poll_sprite(&mut self) {
         while let Ok((id, shiny, result)) = self.sprite_rx.try_recv() {
-            // Only apply if still relevant (user might have moved selection)
+            // Only apply if still relevant to current selection
             if let Some((cur_id, _)) = self.selected_pokemon() {
                 if cur_id == id && shiny == self.shiny {
-                    self.sprite = match result {
-                        Ok(sheet) => SpriteState::Ready { sheet, frame_idx: 0 },
-                        Err(_)    => SpriteState::Failed,
-                    };
+                    self.sprite.set_loaded(id, shiny, result);
                 }
             }
         }
@@ -225,6 +275,10 @@ impl PickerState {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(party: &mut Party, renderer_kind: RendererKind) -> Result<()> {
+    // Freeze the walking daemon so it doesn't write to the TTY while the
+    // picker TUI is open (would cause flashing in the preview panel).
+    daemon_run::pause_daemon();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
@@ -240,25 +294,28 @@ pub async fn run(party: &mut Party, renderer_kind: RendererKind) -> Result<()> {
         // Poll completed sprite loads
         state.poll_sprite();
 
-        // Draw TUI
+        // Advance sprite animation frame
+        state.sprite.tick_frame();
+
+        // Draw TUI (ratatui frame)
         terminal.draw(|f| {
             preview_rect = draw_ui(f, &mut state);
         })?;
 
-        // Post-draw: render sprite into preview panel
+        // Post-draw: render sprite directly over the preview panel (bypasses ratatui)
         render_sprite_preview(&mut state, renderer_kind, preview_rect)?;
         io::stdout().flush()?;
 
-        // Handle input (poll with 100ms timeout for animation ticks)
-        if event::poll(Duration::from_millis(100))? {
+        // Handle input (16ms timeout → ~60fps redraw so sprite stays visible)
+        if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(k) => {
                     if state.search_mode {
                         match k.code {
-                            KeyCode::Esc => { state.search_mode = false; }
+                            KeyCode::Esc   => { state.search_mode = false; }
                             KeyCode::Enter => { state.search_mode = false; }
                             KeyCode::Backspace => { state.search.pop(); state.rebuild_filter(); }
-                            KeyCode::Char(c) => { state.search.push(c); state.rebuild_filter(); }
+                            KeyCode::Char(c)   => { state.search.push(c); state.rebuild_filter(); }
                             _ => {}
                         }
                     } else {
@@ -295,11 +352,6 @@ pub async fn run(party: &mut Party, renderer_kind: RendererKind) -> Result<()> {
                 _ => {}
             }
         }
-
-        // Advance sprite frame occasionally
-        if let SpriteState::Ready { frame_idx, .. } = &mut state.sprite {
-            *frame_idx = frame_idx.wrapping_add(1);
-        }
     }
 
     // Cleanup Kitty images
@@ -312,6 +364,11 @@ pub async fn run(party: &mut Party, renderer_kind: RendererKind) -> Result<()> {
     execute!(io::stdout(), LeaveAlternateScreen, Show)?;
     disable_raw_mode()?;
 
+    // Unfreeze the daemon now that we're back on the main screen.
+    // (restart_if_running in main.rs will handle the full restart if needed;
+    //  resume here covers the no-change / cancel case.)
+    daemon_run::resume_daemon();
+
     // Apply selection to party
     if let Some((species_id, shiny)) = state.added {
         use crate::error::PetcliError;
@@ -320,6 +377,7 @@ pub async fn run(party: &mut Party, renderer_kind: RendererKind) -> Result<()> {
                 let name = POKEMON.iter().find(|(id, _)| *id == species_id)
                     .map(|(_, n)| *n).unwrap_or("Pokemon");
                 println!("Added {}{}!", name, if shiny { " ✦ (shiny)" } else { "" });
+                println!("Run `petcli` to see them walk!");
             }
             Err(PetcliError::PartyFull) => {
                 eprintln!("Party is full (6 Pokemon max). Use `petcli set` to replace one.");
@@ -460,6 +518,13 @@ fn draw_preview_border(f: &mut Frame, area: Rect, state: &PickerState) {
         " Preview ".to_string()
     };
 
+    // Loading indicator in title when fetching a new sprite
+    let title = if state.sprite.is_loading() && !state.sprite.is_ready_for(id, state.shiny) {
+        format!("{} ⟳ ", title.trim_end())
+    } else {
+        title
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -468,13 +533,22 @@ fn draw_preview_border(f: &mut Frame, area: Rect, state: &PickerState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Status line inside preview (sprite loading indicator)
-    let status = match &state.sprite {
-        SpriteState::None       => "  Select a Pokemon",
-        SpriteState::Loading(_) => "  Loading sprite...",
-        SpriteState::Ready { .. } => "",
-        SpriteState::Failed     => "  (sprite unavailable)",
-    };
+    // Status when there's nothing to show yet
+    let show_status = state.sprite.sheet().is_none();
+    if show_status {
+        let status = if state.sprite.failed {
+            "  (sprite unavailable)"
+        } else if state.sprite.is_loading() {
+            "  Loading sprite..."
+        } else {
+            "  Select a Pokemon"
+        };
+        let mid = inner.y + inner.height / 2;
+        f.render_widget(
+            Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
+            Rect { x: inner.x, y: mid, width: inner.width, height: 1 },
+        );
+    }
 
     // Key hints near bottom of inner area
     if inner.height > 2 {
@@ -490,14 +564,6 @@ fn draw_preview_border(f: &mut Frame, area: Rect, state: &PickerState) {
         f.render_widget(
             Paragraph::new(hint),
             Rect { x: inner.x, y: hint_row, width: inner.width, height: 1 },
-        );
-    }
-
-    if !status.is_empty() {
-        let mid = inner.y + inner.height / 2;
-        f.render_widget(
-            Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
-            Rect { x: inner.x, y: mid, width: inner.width, height: 1 },
         );
     }
 }
@@ -527,9 +593,8 @@ fn render_sprite_preview(
     renderer_kind: RendererKind,
     panel: Rect,
 ) -> Result<()> {
-    let SpriteState::Ready { ref sheet, frame_idx } = state.sprite else {
-        return Ok(());
-    };
+    let Some(sheet) = state.sprite.sheet() else { return Ok(()); };
+    let frame_idx = state.sprite.frame_idx();
 
     // Center sprite in the panel (leave room for border + hint line)
     let inner_x = panel.x + 1;
@@ -551,11 +616,37 @@ fn render_sprite_preview(
                 let _ = state.kitty.place(id, col, row, &mut out);
             }
         }
+        RendererKind::Iterm2 => {
+            use crate::renderer::iterm2;
+            use base64::{engine::general_purpose::STANDARD as B64, Engine};
+            use image::{imageops, ImageEncoder};
+
+            let frames = sheet.idle_frames();
+            if frames.is_empty() { return Ok(()); }
+            let frame = &frames[frame_idx % frames.len()];
+
+            let col = inner_x + inner_w.saturating_sub(iterm2::SPRITE_COLS) / 2;
+            let row = inner_y + inner_h.saturating_sub(iterm2::SPRITE_ROWS) / 2;
+
+            let img = &frame.pixels;
+            let scaled = imageops::resize(img, 48, 48, imageops::FilterType::Nearest);
+            let mut buf = Vec::new();
+            let enc = image::codecs::png::PngEncoder::new(&mut buf);
+            let _ = enc.write_image(scaled.as_raw(), 48, 48, image::ExtendedColorType::Rgba8);
+            let encoded = B64.encode(&buf);
+
+            let mut out = io::stdout();
+            iterm2::draw_frame(&mut out, &encoded, col, row)?;
+        }
         RendererKind::Unicode => {
             let frames = sheet.idle_frames();
             if frames.is_empty() { return Ok(()); }
             let frame = &frames[frame_idx % frames.len()];
-            let rendered = unicode::render_frame(&frame.pixels, false);
+
+            // Use a larger size in the picker (24×12 cells) for visibility
+            const PREVIEW_COLS: u16 = 24;
+            const PREVIEW_ROWS: u16 = 12;
+            let rendered = unicode::render_frame_sized(&frame.pixels, PREVIEW_COLS, PREVIEW_ROWS, false);
 
             let sprite_rows = rendered.len() as u16;
             let sprite_cols = rendered.first().map(|r| r.len() as u16).unwrap_or(0);

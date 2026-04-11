@@ -19,7 +19,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Set which Pokemon appears (by name or Pokedex number)
+    /// Set which Pokemon appears, replacing the whole party
     Set {
         /// Pokemon name or number (e.g. "pikachu" or "25")
         pokemon: String,
@@ -27,18 +27,25 @@ pub enum Commands {
         #[arg(long)]
         shiny: bool,
     },
-    /// Show current Pokemon
+    /// Show all Pokemon currently in your party (with slot numbers)
     Status,
-    /// Add another Pokemon (up to 6 walk at once)
+    /// Add another Pokemon by name or number (up to 6 walk at once)
     Add {
-        /// Pokemon name or number (leave empty to open the picker)
-        pokemon: Option<String>,
+        /// Pokemon name or number (e.g. "pikachu" or "25")
+        pokemon: String,
         /// Force shiny variant
         #[arg(long)]
         shiny: bool,
     },
-    /// List all available Pokemon
+    /// Browse all 493 Pokemon with live sprite preview and add to party
     Pokemon,
-    /// Remove all pets from your terminal
+    /// Remove a Pokemon from your party by its slot number (see `petcli status`)
+    Remove {
+        /// Slot number shown in `petcli status` (e.g. 2 to remove the 2nd Pokemon)
+        number: usize,
+    },
+    /// Wipe all Pokemon from your party (does not stop the daemon)
+    Reset,
+    /// Stop the walking daemon and clear all pets from the terminal
     Stop,
 }

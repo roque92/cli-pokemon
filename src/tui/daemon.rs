@@ -14,6 +14,7 @@ use rand::{rngs::SmallRng, SeedableRng};
 use crate::{
     animation::walk::Walker,
     renderer::{
+        iterm2::{self, Iterm2Frames},
         kitty::{image_id, KittyRenderer},
         unicode::{self, RenderedFrame},
         RendererKind,
@@ -50,6 +51,7 @@ struct PetActor {
     walker: Walker,
     frame_idx: usize,
     uframes: Option<UnicodeFrames>,
+    iframes: Option<Iterm2Frames>,
     prev_col: Option<u16>,
     prev_row: Option<u16>,
 }
@@ -68,8 +70,15 @@ impl PetActor {
         out: &mut impl Write,
     ) -> Self {
         let sheet = sprite::load_sheet(species_id, shiny).await.ok();
+
         let uframes = if renderer_kind == RendererKind::Unicode {
             sheet.as_ref().map(UnicodeFrames::prerender)
+        } else {
+            None
+        };
+
+        let iframes = if renderer_kind == RendererKind::Iterm2 {
+            sheet.as_ref().map(Iterm2Frames::prerender)
         } else {
             None
         };
@@ -97,6 +106,7 @@ impl PetActor {
             walker,
             frame_idx: 0,
             uframes,
+            iframes,
             prev_col: None,
             prev_row: None,
         }
@@ -109,8 +119,10 @@ impl PetActor {
 
     fn erase(&mut self, out: &mut impl Write, renderer_kind: RendererKind) {
         if let (Some(pc), Some(pr)) = (self.prev_col, self.prev_row) {
-            if renderer_kind == RendererKind::Unicode {
-                let _ = unicode::clear_frame(out, pc, pr);
+            match renderer_kind {
+                RendererKind::Unicode => { let _ = unicode::clear_frame(out, pc, pr); }
+                RendererKind::Iterm2  => { let _ = iterm2::clear_frame(out, pc, pr); }
+                RendererKind::Kitty   => {} // Kitty uses delete-all before each redraw
             }
         }
     }
@@ -132,6 +144,12 @@ impl PetActor {
                     let _ = unicode::draw_frame(
                         out, uf.get(is_walk, flip, self.frame_idx), col, row,
                     );
+                }
+            }
+            RendererKind::Iterm2 => {
+                if let Some(iframes) = &self.iframes {
+                    let encoded = iframes.get(is_walk, flip, self.frame_idx);
+                    let _ = iterm2::draw_frame(out, encoded, col, row);
                 }
             }
             RendererKind::Kitty => {
@@ -178,6 +196,7 @@ pub async fn run(renderer_kind: RendererKind) -> Result<()> {
 
     let (sprite_cols, sprite_rows) = match renderer_kind {
         RendererKind::Kitty   => (6u16, 3u16),
+        RendererKind::Iterm2  => (iterm2::SPRITE_COLS, iterm2::SPRITE_ROWS),
         RendererKind::Unicode => (unicode::SPRITE_COLS, unicode::SPRITE_ROWS),
     };
 

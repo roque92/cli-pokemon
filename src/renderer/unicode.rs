@@ -8,31 +8,39 @@ use crossterm::{
 };
 use image::{imageops, Rgba, RgbaImage};
 
-/// Sprite display dimensions in terminal cells.
-/// 48px source scaled to 24 cols × 24 pixel rows → 12 half-block rows.
-pub const SPRITE_COLS: u16 = 24;
-pub const SPRITE_ROWS: u16 = 12;
+/// Sprite display dimensions in terminal cells for the live daemon.
+/// 48px source → 12 cols × 6 half-block rows (≈ Kitty/iTerm2 footprint).
+pub const SPRITE_COLS: u16 = 12;
+pub const SPRITE_ROWS: u16 = 6;
 
 /// A rendered frame: rows of (fg, bg, char) cells.
 pub type RenderedRow = Vec<(Color, Color, char)>;
 pub type RenderedFrame = Vec<RenderedRow>;
 
-/// Pre-render a decoded GIF frame into half-block terminal cells.
-/// Set `flip = true` to mirror horizontally (for left-facing walk).
-pub fn render_frame(img: &RgbaImage, flip: bool) -> RenderedFrame {
-    let w = SPRITE_COLS as u32;
-    let h = (SPRITE_ROWS * 2) as u32; // 2 pixel rows per half-block row
+/// Pre-render a decoded GIF frame into half-block terminal cells at an explicit
+/// cell size. `cols` terminal columns × `rows` terminal rows (each row = 2 px).
+pub fn render_frame_sized(img: &RgbaImage, cols: u16, rows: u16, flip: bool) -> RenderedFrame {
+    let w = cols as u32;
+    let h = (rows * 2) as u32;
 
     let scaled = if flip {
-        let flipped = imageops::flip_horizontal(img);
-        imageops::resize(&flipped, w, h, imageops::FilterType::Nearest)
+        imageops::resize(&imageops::flip_horizontal(img), w, h, imageops::FilterType::Nearest)
     } else {
         imageops::resize(img, w, h, imageops::FilterType::Nearest)
     };
 
+    half_blocks(&scaled)
+}
+
+/// Pre-render at the standard daemon sprite size (SPRITE_COLS × SPRITE_ROWS).
+pub fn render_frame(img: &RgbaImage, flip: bool) -> RenderedFrame {
+    render_frame_sized(img, SPRITE_COLS, SPRITE_ROWS, flip)
+}
+
+fn half_blocks(scaled: &RgbaImage) -> RenderedFrame {
     let height = scaled.height();
-    let width = scaled.width();
-    let mut rows = Vec::with_capacity(SPRITE_ROWS as usize);
+    let width  = scaled.width();
+    let mut rows = Vec::with_capacity((height / 2) as usize);
 
     let mut y = 0u32;
     while y + 1 < height {
@@ -45,10 +53,10 @@ pub fn render_frame(img: &RgbaImage, flip: bool) -> RenderedFrame {
             let l_opaque = lower[3] >= 128;
 
             let (ch, fg, bg) = match (u_opaque, l_opaque) {
-                (true, true)   => ('▀', ansi_color(upper), ansi_color(lower)),
-                (true, false)  => ('▀', ansi_color(upper), Color::Reset),
+                (true,  true)  => ('▀', ansi_color(upper), ansi_color(lower)),
+                (true,  false) => ('▀', ansi_color(upper), Color::Reset),
                 (false, true)  => ('▄', ansi_color(lower), Color::Reset),
-                (false, false) => (' ', Color::Reset, Color::Reset),
+                (false, false) => (' ', Color::Reset,       Color::Reset),
             };
             row.push((fg, bg, ch));
         }
@@ -64,12 +72,7 @@ pub fn draw_frame(out: &mut impl Write, frame: &RenderedFrame, col: u16, row: u1
     for (r, line) in frame.iter().enumerate() {
         queue!(out, MoveTo(col, row + r as u16))?;
         for (fg, bg, ch) in line {
-            queue!(
-                out,
-                SetForegroundColor(*fg),
-                SetBackgroundColor(*bg),
-                Print(ch)
-            )?;
+            queue!(out, SetForegroundColor(*fg), SetBackgroundColor(*bg), Print(ch))?;
         }
         queue!(out, ResetColor)?;
     }
@@ -87,12 +90,8 @@ pub fn clear_frame(out: &mut impl Write, col: u16, row: u16) -> Result<()> {
 
 fn ansi_color(px: &Rgba<u8>) -> Color {
     fn step(c: u8) -> u8 {
-        if c < 48 { 0 }
-        else if c < 115 { 1 }
-        else if c < 155 { 2 }
-        else if c < 195 { 3 }
-        else if c < 235 { 4 }
-        else { 5 }
+        if c < 48 { 0 } else if c < 115 { 1 } else if c < 155 { 2 }
+        else if c < 195 { 3 } else if c < 235 { 4 } else { 5 }
     }
     Color::AnsiValue(16 + 36 * step(px[0]) + 6 * step(px[1]) + step(px[2]))
 }

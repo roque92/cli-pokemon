@@ -60,6 +60,7 @@ pub async fn run(party: Party, renderer_kind: RendererKind) -> Result<()> {
     let exe = std::env::current_exe()?;
     let renderer_flag = match renderer_kind {
         RendererKind::Kitty   => "kitty",
+        RendererKind::Iterm2  => "iterm2",
         RendererKind::Unicode => "unicode",
     };
 
@@ -86,6 +87,45 @@ pub async fn run(party: Party, renderer_kind: RendererKind) -> Result<()> {
     println!("{} now walking in your terminal!", names.join(", "));
     println!("Run `petcli stop` to remove  |  `petcli add <name>` to add more");
     Ok(())
+}
+
+/// Suspend the daemon (freeze it in place) without killing it.
+/// Call `resume_daemon()` to unfreeze. Used to prevent the daemon from
+/// interfering with alternate-screen TUIs like the picker.
+pub fn pause_daemon() {
+    #[cfg(unix)]
+    if let Ok(Some(pid)) = read_pid() {
+        if process_alive(pid) {
+            unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+        }
+    }
+    // Windows: no SIGSTOP equivalent — the daemon will briefly flicker but
+    // the picker's alternate screen still isolates most of the interference.
+}
+
+/// Resume a daemon that was paused with `pause_daemon()`.
+pub fn resume_daemon() {
+    #[cfg(unix)]
+    if let Ok(Some(pid)) = read_pid() {
+        unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+    }
+}
+
+/// If the daemon is running, stop it and restart it so it picks up the new
+/// party state. Called after any command that modifies the party.
+pub async fn restart_if_running(party: &crate::state::party::Party, renderer_kind: RendererKind) -> Result<()> {
+    let Some(pid) = read_pid()? else { return Ok(()); };
+    if !process_alive(pid) {
+        let _ = std::fs::remove_file(pid_path()?);
+        return Ok(());
+    }
+    // Stop the old daemon
+    kill_process(pid);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let _ = std::fs::remove_file(pid_path()?);
+
+    // Restart with updated party
+    run(party.clone(), renderer_kind).await
 }
 
 /// Kill the daemon and restore the terminal.
